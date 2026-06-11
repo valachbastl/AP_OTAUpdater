@@ -147,3 +147,7 @@ All slug parameters must match the values registered on the server.
 ## Author
 
 Petr Adámek
+
+## License
+
+MIT — see [LICENSE](LICENSE).

@@ -233,15 +233,21 @@ void AP_OTAUpdater::setupClientConfig(esp_http_client_config_t& config, const ch
 // HTTP helpers
 // =============================================================================
 
-bool AP_OTAUpdater::downloadString(const char* url, char* buf, size_t len)
+// Otevre HTTP klienta: init + X-OTA-Key + odhlaseni z WDT + open + fetch headers
+// + overeni statusu 200. Pri uspechu vraci otevreneho clienta (caller ho musi
+// zavrit + cleanupnout a podle wdtWasOn znovu prihlasit do WDT). Pri chybe uklidi
+// a vrati nullptr. Sdileno downloadString() a downloadFirmware().
+esp_http_client_handle_t AP_OTAUpdater::_openClient(const char* url, bool& wdtWasOn, int64_t* contentLength)
 {
+    wdtWasOn = false;
+
     esp_http_client_config_t config = {};
     setupClientConfig(config, url);
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
         ESP_LOGE(TAG, "HTTP client init failed");
-        return false;
+        return nullptr;
     }
 
     if (_otaKey[0]) {
@@ -249,25 +255,36 @@ bool AP_OTAUpdater::downloadString(const char* url, char* buf, size_t len)
     }
 
     // Odhlásit z WDT — připojení může blokovat až do timeoutu
-    esp_err_t wdt = esp_task_wdt_delete(NULL);
+    wdtWasOn = (esp_task_wdt_delete(NULL) == ESP_OK);
 
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
-        if (wdt == ESP_OK) esp_task_wdt_add(NULL);
-        return false;
+        if (wdtWasOn) esp_task_wdt_add(NULL);
+        return nullptr;
     }
 
-    esp_http_client_fetch_headers(client);
+    int64_t cl = esp_http_client_fetch_headers(client);
+    if (contentLength) *contentLength = cl;
+
     int status = esp_http_client_get_status_code(client);
     if (status != 200) {
         ESP_LOGW(TAG, "HTTP status: %d", status);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        if (wdt == ESP_OK) esp_task_wdt_add(NULL);
-        return false;
+        if (wdtWasOn) esp_task_wdt_add(NULL);
+        return nullptr;
     }
+
+    return client;
+}
+
+bool AP_OTAUpdater::downloadString(const char* url, char* buf, size_t len)
+{
+    bool wdtWasOn;
+    esp_http_client_handle_t client = _openClient(url, wdtWasOn, nullptr);
+    if (!client) return false;
 
     int readLen = esp_http_client_read(client, buf, (int)len - 1);
     if (readLen < 0) readLen = 0;
@@ -280,46 +297,17 @@ bool AP_OTAUpdater::downloadString(const char* url, char* buf, size_t len)
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    if (wdt == ESP_OK) esp_task_wdt_add(NULL);
+    if (wdtWasOn) esp_task_wdt_add(NULL);
 
     return readLen > 0;
 }
 
 bool AP_OTAUpdater::downloadFirmware(const char* url)
 {
-    esp_http_client_config_t config = {};
-    setupClientConfig(config, url);
-
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) {
-        ESP_LOGE(TAG, "HTTP client init failed");
-        return false;
-    }
-
-    if (_otaKey[0]) {
-        esp_http_client_set_header(client, "X-OTA-Key", _otaKey);
-    }
-
-    // Odhlásit z WDT — připojení může blokovat až do timeoutu
-    esp_err_t wdt = esp_task_wdt_delete(NULL);
-
-    esp_err_t err = esp_http_client_open(client, 0);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP open failed: %s", esp_err_to_name(err));
-        esp_http_client_cleanup(client);
-        if (wdt == ESP_OK) esp_task_wdt_add(NULL);
-        return false;
-    }
-
-    int64_t contentLength = esp_http_client_fetch_headers(client);
-    int     status        = esp_http_client_get_status_code(client);
-    if (status != 200) {
-        ESP_LOGE(TAG, "HTTP status: %d", status);
-        esp_http_client_close(client);
-        esp_http_client_cleanup(client);
-        if (wdt == ESP_OK) esp_task_wdt_add(NULL);
-        return false;
-    }
+    bool    wdtWasOn;
+    int64_t contentLength = 0;
+    esp_http_client_handle_t client = _openClient(url, wdtWasOn, &contentLength);
+    if (!client) return false;
 
     ESP_LOGI(TAG, "Firmware size: %lld bytes", (long long)contentLength);
 
@@ -328,22 +316,22 @@ bool AP_OTAUpdater::downloadFirmware(const char* url)
         ESP_LOGE(TAG, "No OTA partition found");
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        if (wdt == ESP_OK) esp_task_wdt_add(NULL);
+        if (wdtWasOn) esp_task_wdt_add(NULL);
         return false;
     }
 
     esp_ota_handle_t ota_handle;
-    err = esp_ota_begin(partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
+    esp_err_t err = esp_ota_begin(partition, OTA_WITH_SEQUENTIAL_WRITES, &ota_handle);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
-        if (wdt == ESP_OK) esp_task_wdt_add(NULL);
+        if (wdtWasOn) esp_task_wdt_add(NULL);
         return false;
     }
 
     // Znovu přihlásit do WDT před zápisovou smyčkou — reset každý chunk
-    if (wdt == ESP_OK) esp_task_wdt_add(NULL);
+    if (wdtWasOn) esp_task_wdt_add(NULL);
 
     uint8_t* chunk = (uint8_t*)malloc(CHUNK_SIZE);
     if (!chunk) {
@@ -378,7 +366,7 @@ bool AP_OTAUpdater::downloadFirmware(const char* url)
             _progressCallback((int)((written * 100) / contentLength));
         }
 
-        if (wdt == ESP_OK) esp_task_wdt_reset();
+        if (wdtWasOn) esp_task_wdt_reset();
     }
 
     free(chunk);

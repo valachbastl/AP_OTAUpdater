@@ -240,6 +240,7 @@ private:
     void     normalizeMAC(const char* mac, char* out, size_t len);
     void     buildURL(char* buf, size_t len, bool download);
     void     setupClientConfig(esp_http_client_config_t& config, const char* url);
+    esp_http_client_handle_t _openClient(const char* url, bool& wdtWasOn, int64_t* contentLength);
     bool     downloadString(const char* url, char* buf, size_t len);
     bool     downloadFirmware(const char* url);
     void     markChecked();

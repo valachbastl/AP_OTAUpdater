@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.0] - 2026-06-11
+
+### Changed
+- Interni refaktor: spolecny HTTP boilerplate (`init` + `X-OTA-Key` + WDT delete + `open` + `fetch_headers` + status check + cleanup) vytazen do privatniho `_openClient()` — sdileno `downloadString()` a `downloadFirmware()`, odstranena duplicita ~25 radku. Chovani i WDT logika beze zmeny.
+- Licence zmenena na MIT (drive UNLICENSED).
+
 ## [1.0.0] - 2026-05-28
 
 ### Added

@@ -1,7 +1,7 @@
 {
     "name": "AP_OTAUpdater",
-    "version": "1.0.0",
-    "releaseDate": "2026-05-28",
+    "version": "1.1.0",
+    "releaseDate": "2026-06-11",
     "description": "OTA firmware updater for AP OTA Server — HTTP/HTTPS, universal network (WiFi, W5500, LAN8720A, ESP32-P4 EMAC), configurable scheduler (interval / daily / weekly)",
     "keywords": ["ota", "update", "http", "https", "esp-idf", "esp32", "w5500", "ethernet", "scheduler"],
     "authors": [
@@ -9,7 +9,7 @@
             "name": "Petr Adámek"
         }
     ],
-    "license": "UNLICENSED",
+    "license": "MIT",
     "repository": {
         "type": "git",
         "url": "https://github.com/valachbastl/AP_OTAUpdater.git"
