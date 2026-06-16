@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.1.1] - 2026-06-16
+
+### Added
+- ESP-IDF component baleni (`CMakeLists.txt` + `idf_component.yml`) - pouzitelne jako cista ESP-IDF komponenta, nejen pres PlatformIO. Bez zmeny kodu.
+
 ## [1.1.0] - 2026-06-11
 
 ### Changed

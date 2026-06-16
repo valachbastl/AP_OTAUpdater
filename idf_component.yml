@@ -1,0 +1,4 @@
+version: "1.1.1"
+description: "OTA firmware updater for AP OTA Server (HTTP/HTTPS, universal network, configurable scheduler) for ESP-IDF"
+dependencies:
+  idf: ">=5.0.0"
