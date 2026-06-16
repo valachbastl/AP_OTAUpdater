@@ -15,6 +15,13 @@ lib_deps =
     https://github.com/valachbastl/AP_OTAUpdater.git
 ```
 
+Or with specific version:
+
+```ini
+lib_deps =
+    https://github.com/valachbastl/AP_OTAUpdater.git#v1.1.1
+```
+
 ## Partition table
 
 Project must have an OTA-capable partition table (`partitions.csv`):
