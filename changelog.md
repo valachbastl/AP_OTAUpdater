@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.2.0] - 2026-07-27
+
+### Fixed
+- `downloadString()` nyní čte HTTP odpověď ve smyčce až do EOF/zaplnění bufferu místo jednoho volání `esp_http_client_read()` — odpověď rozdělená přes více TCP segmentů mohla být dřív tiše useknutá (`downloadFirmware()` už smyčkoval správně).
+
+### Changed
+- Plánování `INTERVAL` (`isDue()` / `markChecked()`) přepnuto z wall-clock `time(nullptr)` na monotónní `esp_timer_get_time()` — hardening, ne oprava konkrétního pozorovaného bugu (ten byl v `AP_TaskUtils`, viz jeho changelog v2.6.0 — DFS/esp_pm rozhazovalo FreeRTOS tick, takže periodický task volal `isDue()` méně často, než měl). Monotónní čas je pro měření intervalu obecně robustnější než wall-clock: `time()` může skočit v okamžiku SNTP synchronizace (dřív nesynchronizováno → naráz o desítky let), což by delta výpočet zkreslilo. `DAILY`/`WEEKLY` nejsou dotčené — ty ze své podstaty potřebují wall-clock čas dne a nadále se spoléhají na `time()`/SNTP, jak je zdokumentováno.
+- Všechny komentáře ve zdrojácích přeloženy z češtiny do angličtiny, pro konzistenci s `AP_DS18B20`/`AP_TaskUtils` (obecná konvence od 2026-07-27, viz `_LIBRARIES_STATUS.md`).
+- Zdokumentováno, že instance není thread-safe (volat jen z jednoho tasku) — beze změny chování, jen explicitní.
+
+**Otestováno na HW** — potvrzeno; ještě proběhne dodatečné ověření před nasazením do produkce.
+
 ## [1.1.1] - 2026-06-16
 
 ### Added

@@ -24,6 +24,7 @@ AP_OTAUpdater::AP_OTAUpdater(const char* serverURL,
     , _scheduledMinute(0)
     , _scheduledDay(1)
     , _lastCheckTime(0)
+    , _lastCheckUptimeUs(-1)
     , _progressCallback(nullptr)
 {
     strncpy(_serverURL, serverURL, sizeof(_serverURL) - 1);
@@ -115,12 +116,14 @@ bool AP_OTAUpdater::isDue() const
             return false;
 
         case INTERVAL:
-            if (_lastCheckTime == 0) return true;
-            return (time(nullptr) - _lastCheckTime) >= (time_t)_intervalSeconds;
+            // Monotonic esp_timer, not time() — immune to RTC/NTP drift or an
+            // unsynchronized clock, which would otherwise make this delta unreliable.
+            if (_lastCheckUptimeUs < 0) return true;
+            return (esp_timer_get_time() - _lastCheckUptimeUs) >= (int64_t)_intervalSeconds * 1000000LL;
 
         case DAILY: {
             time_t now = time(nullptr);
-            if (now < 1000000000L) return false; // čas nesynchronizován
+            if (now < 1000000000L) return false; // time not synchronized
 
             struct tm tmNow;
             localtime_r(&now, &tmNow);
@@ -131,13 +134,13 @@ bool AP_OTAUpdater::isDue() const
             tmSched.tm_sec      = 0;
             time_t scheduledNow = mktime(&tmSched);
 
-            // true pokud aktuální čas je po naplánovaném a od toho okna ještě nebyla kontrola
+            // true if current time is past the scheduled time and no check has happened since
             return (now >= scheduledNow) && (_lastCheckTime < scheduledNow);
         }
 
         case WEEKLY: {
             time_t now = time(nullptr);
-            if (now < 1000000000L) return false; // čas nesynchronizován
+            if (now < 1000000000L) return false; // time not synchronized
 
             struct tm tmNow;
             localtime_r(&now, &tmNow);
@@ -158,7 +161,8 @@ bool AP_OTAUpdater::isDue() const
 
 void AP_OTAUpdater::markChecked()
 {
-    _lastCheckTime = time(nullptr);
+    _lastCheckTime     = time(nullptr);        // wall-clock display value + DAILY/WEEKLY
+    _lastCheckUptimeUs = esp_timer_get_time();  // monotonic — drives INTERVAL scheduling
 }
 
 // =============================================================================
@@ -219,7 +223,7 @@ void AP_OTAUpdater::setupClientConfig(esp_http_client_config_t& config, const ch
     } else if (isHttps && _insecure) {
 #if CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY
         config.skip_cert_common_name_check = true;
-        // bez cert_pem a crt_bundle_attach → TLS bez ověření certifikátu
+        // no cert_pem or crt_bundle_attach → TLS without certificate verification
 #else
         ESP_LOGW(TAG, "setInsecure() requires CONFIG_ESP_TLS_SKIP_SERVER_CERT_VERIFY=y in sdkconfig");
         config.crt_bundle_attach = esp_crt_bundle_attach;
@@ -233,10 +237,10 @@ void AP_OTAUpdater::setupClientConfig(esp_http_client_config_t& config, const ch
 // HTTP helpers
 // =============================================================================
 
-// Otevre HTTP klienta: init + X-OTA-Key + odhlaseni z WDT + open + fetch headers
-// + overeni statusu 200. Pri uspechu vraci otevreneho clienta (caller ho musi
-// zavrit + cleanupnout a podle wdtWasOn znovu prihlasit do WDT). Pri chybe uklidi
-// a vrati nullptr. Sdileno downloadString() a downloadFirmware().
+// Opens an HTTP client: init + X-OTA-Key + unregister from WDT + open + fetch headers
+// + verify status 200. On success returns the open client (caller must close +
+// clean it up, and re-register with WDT per wdtWasOn). On error cleans up and
+// returns nullptr. Shared by downloadString() and downloadFirmware().
 esp_http_client_handle_t AP_OTAUpdater::_openClient(const char* url, bool& wdtWasOn, int64_t* contentLength)
 {
     wdtWasOn = false;
@@ -254,7 +258,7 @@ esp_http_client_handle_t AP_OTAUpdater::_openClient(const char* url, bool& wdtWa
         esp_http_client_set_header(client, "X-OTA-Key", _otaKey);
     }
 
-    // Odhlásit z WDT — připojení může blokovat až do timeoutu
+    // Unregister from WDT — the connection may block up to the timeout
     wdtWasOn = (esp_task_wdt_delete(NULL) == ESP_OK);
 
     esp_err_t err = esp_http_client_open(client, 0);
@@ -286,20 +290,30 @@ bool AP_OTAUpdater::downloadString(const char* url, char* buf, size_t len)
     esp_http_client_handle_t client = _openClient(url, wdtWasOn, nullptr);
     if (!client) return false;
 
-    int readLen = esp_http_client_read(client, buf, (int)len - 1);
-    if (readLen < 0) readLen = 0;
-    buf[readLen] = '\0';
+    // Loop until EOF/buffer full rather than a single read — a response can
+    // arrive across multiple TCP segments, and esp_http_client_read() is not
+    // guaranteed to return the whole body in one call.
+    size_t total = 0;
+    bool   ok    = true;
 
-    while (readLen > 0 &&
-           (buf[readLen - 1] == '\n' || buf[readLen - 1] == '\r' || buf[readLen - 1] == ' ')) {
-        buf[--readLen] = '\0';
+    while (len > 1 && total < len - 1) {
+        int readLen = esp_http_client_read(client, buf + total, (int)(len - 1 - total));
+        if (readLen < 0) { ok = false; break; }
+        if (readLen == 0) break; // EOF
+        total += (size_t)readLen;
+    }
+    buf[total] = '\0';
+
+    while (total > 0 &&
+           (buf[total - 1] == '\n' || buf[total - 1] == '\r' || buf[total - 1] == ' ')) {
+        buf[--total] = '\0';
     }
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     if (wdtWasOn) esp_task_wdt_add(NULL);
 
-    return readLen > 0;
+    return ok && total > 0;
 }
 
 bool AP_OTAUpdater::downloadFirmware(const char* url)
@@ -330,7 +344,7 @@ bool AP_OTAUpdater::downloadFirmware(const char* url)
         return false;
     }
 
-    // Znovu přihlásit do WDT před zápisovou smyčkou — reset každý chunk
+    // Re-register with WDT before the write loop — reset every chunk
     if (wdtWasOn) esp_task_wdt_add(NULL);
 
     uint8_t* chunk = (uint8_t*)malloc(CHUNK_SIZE);

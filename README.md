@@ -19,7 +19,7 @@ Or with specific version:
 
 ```ini
 lib_deps =
-    https://github.com/valachbastl/AP_OTAUpdater.git#v1.1.1
+    https://github.com/valachbastl/AP_OTAUpdater.git#v1.2.0
 ```
 
 ## Partition table
@@ -149,7 +149,7 @@ All slug parameters must match the values registered on the server.
 | `DAILY` | True once per day after HH:MM (requires synced time) | 60 s |
 | `WEEKLY` | True once per week on set day after HH:MM (requires synced time) | 60 s |
 
-**Note:** `_lastCheckTime` is stored in RAM and resets on every restart. On boot, `INTERVAL` mode triggers immediately; `DAILY`/`WEEKLY` trigger if the scheduled time has already passed today/this week.
+**Note:** last-check state is stored in RAM and resets on every restart. On boot, `INTERVAL` mode triggers immediately; `DAILY`/`WEEKLY` trigger if the scheduled time has already passed today/this week. `INTERVAL` timing runs off the monotonic `esp_timer`, so it works correctly even without SNTP/RTC sync; `DAILY`/`WEEKLY` need synced wall-clock time (`getLastCheckTime()` reflects it once synced).
 
 ## Author
 
