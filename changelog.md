@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.3.0] - 2026-10-21
+
+Podpora AP_OTAServer 1.2.0 (hlavičky `X-OTA-Size` / `X-OTA-SHA256`, parametr `unit`) + ESP-IDF 6. Se starším serverem funguje dál, jen bez kontrol velikosti a hashe.
+
+### Added
+- Kontrola **SHA-256** staženého obrazu proti `X-OTA-SHA256` — počítá se průběžně při zápisu, při neshodě `esp_ota_abort()` a boot oddíl se nepřepne. Bez hlavičky (server < 1.2.0) se kontrola přeskočí s varováním; `requireHash(true)` takový update odmítne.
+- Velikost firmwaru z `X-OTA-Size` (pořadí `X-OTA-Size` → `Content-Length` → neznámá), hlavičky odpovědi čtené přes `event_handler` HTTP klienta.
+- Kontrola, že se FW vejde do OTA oddílu — už po kroku 1 (vůbec se nestahuje) a znovu před `esp_ota_begin()`. Flash se dál maže po sektorech během zápisu (`OTA_WITH_SEQUENTIAL_WRITES`) i při známé velikosti — zkoušené jednorázové smazání celého obrazu předem (~2 s na 1 MB) se na HOME-Thermostat BOARD časově shodovalo s `STALE_PACKET_ERROR` na lince k displeji, mimo OTA se tahle chyba neobjevuje.
+- `setUnit()` / `setUnitFromMAC()` / `getUnit()` — seskupení čipů do přístroje (`&unit=` v kroku 1), normalizace a validace jako na serveru, jen v RAM.
+- `enum class Result` + `update()`, `getLastResult()`, `resultToString()` — důvod, proč update neproběhl (`NoFirmware`, `TooLarge`, `HashMismatch`, …). `bool` varianty (`performUpdate()`, `check()`) zachovány.
+- Callbacky `setStartCallback()` (verze + velikost), `setProgressBytesCallback()` (bajty, i při neznámé velikosti), `setResultCallback()` — s volitelným `userData` (kontext předaný do callbacku); `getLastServerSize()`.
+- README: sekce o rollbacku (`esp_ota_mark_app_valid_cancel_rollback()` je úkol aplikace) a o kódování URL.
+- Během stahování se při `CONFIG_PM_ENABLE` drží PM zámek `ESP_PM_CPU_FREQ_MAX` (RAII, uvolní se na všech cestách) — obchází deadlock v `esp_pm` při přepínání frekvence pod hustým tokem přerušení (zjištěno na ESP32-P4 + SDIO při přenosu v AP_HostedUpdater 2026-10-19, stejná oprava tam ověřena na HW). `esp_pm` přidán do `REQUIRES`.
+
+### Fixed
+- Při odpovědi bez `Content-Length` (gzip hostingu + Cloudflare → chunked, ověřeno curlem na produkci) se nevolal progress callback a přeskočila se kontrola úplnosti — teď se velikost bere z `X-OTA-Size` a navíc se kontroluje `esp_http_client_is_complete_data_received()` (předčasně ukončený přenos = `SizeMismatch`).
+- `getServerVersion()` nyní opravdu aktualizuje `getLastServerVersion()`, jak tvrdila dokumentace (dřív to dělal jen `isUpdateAvailable()`).
+
+### Changed
+- ESP-IDF 6: SHA-256 přes PSA Crypto API (mbedTLS 4 / TF-PSA-Crypto už nemá veřejné `mbedtls_sha256_*`); na IDF 5.x se dál použije `mbedtls_sha256_*`.
+- HTTP 404 v kroku 1 (na serveru není FW pro tuto kombinaci) se loguje jako info, ne warning. 404 v kroku 2 (politika změněná mezi kroky) → `ServerError`.
+- `setProgressCallback()` se volá jen při změně procenta (dřív po každém 4kB bloku).
+- Hodnoty v URL se kódují (RFC 3986) — pro běžné slugy/verze/MAC se URL nemění; příliš dlouhá URL se odmítne s chybou místo tichého useknutí (dřív `snprintf` do 768 B).
+- Konstruktor a settery snesou `nullptr` (bere se jako prázdný řetězec / zrušení).
+
+**Otestováno na HW** — HOME-Thermostat BOARD (ESP32-P4, W5500, ESP-IDF 6.1) proti produkčnímu serveru přes Cloudflare: reálný update 26.10.3 → 26.10.4, velikost z `X-OTA-Size`, SHA-256 OK, naběhla nová verze, 404 bez FW i `UpToDate` správně. Dále HOME-Thermostat DISPLAY (ESP32-S3, WiFi): update 26.10.3 → 26.10.4 OK.
+
 ## [1.2.0] - 2026-07-27
 
 ### Fixed

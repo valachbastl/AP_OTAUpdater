@@ -14,16 +14,26 @@
  * AP_OTAUpdater — OTA client for AP OTA Server
  *
  * Protocol (AP OTA Server ota.php):
- *   Step 1 – GET /ota.php?group=&type=&component=&hw=&device=&fw=&uptime=&interval=
+ *   Step 1 – GET /ota.php?group=&type=&component=&hw=&device=&fw=&uptime=&interval=[&unit=]
  *             → 200 plain text "26.5.1"   |  404 no firmware
  *   Step 2 – GET /ota.php?...&download=1
  *             → 200 binary firmware data
+ *   Both steps (server >= 1.2.0) also send X-OTA-Size (bytes) and X-OTA-SHA256
+ *   (lowercase hex) for the offered firmware. Content-Length may be lost on the
+ *   way (hosting gzip + Cloudflare → chunked); the custom headers always arrive.
  *
+ * Integrity:   the download is verified against X-OTA-Size and X-OTA-SHA256 before
+ *              the boot partition is switched; older servers without these headers
+ *              still work, just without the checks (see requireHash()).
  * Auth:        setOTAKey() — X-OTA-Key header (APP_SECRET on server, OTA_AUTH=true)
  * TLS:         embedded certificate bundle (default), custom CA, or no verification
  * WDT:         automatic handling, compatible with AP_TaskUtils tasks
  * Versioning:  compares any version difference → both upgrade and downgrade work
+ *              (the server decides what to offer, incl. frozen devices / no-downgrade)
  * Threading:   instance is not thread-safe — call only from a single task
+ * Power mgmt:  with CONFIG_PM_ENABLE an ESP_PM_CPU_FREQ_MAX lock is held while the
+ *              firmware is downloaded — avoids an esp_pm frequency-switch deadlock
+ *              under heavy interrupt load (seen on ESP32-P4 + SDIO, ESP-IDF 6.1)
  *
  * Time source: INTERVAL scheduling runs off the monotonic esp_timer (immune to
  * NTP/RTC drift or missing time sync). DAILY/WEEKLY inherently need wall-clock
@@ -53,6 +63,26 @@ public:
         DAILY,    ///< every day at HH:MM (requires synchronized time — SNTP)
         WEEKLY    ///< specific day of week at HH:MM (requires synchronized time)
     };
+
+    /** @brief Outcome of an update attempt — see update(), getLastResult(), resultToString() */
+    enum class Result {
+        None,          ///< no update attempt made yet
+        UpToDate,      ///< server offers the running version (also when the server blocks the update)
+        Updated,       ///< firmware installed — caller must call esp_restart()
+        NoFirmware,    ///< server has no firmware for this group/type/component/hw (HTTP 404 in step 1)
+        ServerError,   ///< unexpected HTTP status or empty response
+        NetworkError,  ///< connection / TLS / read failure
+        NoPartition,   ///< no OTA partition in the partition table
+        TooLarge,      ///< firmware does not fit into the OTA partition (nothing downloaded)
+        NoMemory,      ///< buffer allocation failed
+        WriteError,    ///< esp_ota_begin / write / end / set_boot_partition failed
+        SizeMismatch,  ///< downloaded size differs from X-OTA-Size / Content-Length, or stream incomplete
+        HashMissing,   ///< requireHash(true) and the server sent no X-OTA-SHA256
+        HashMismatch   ///< SHA-256 of the downloaded image differs from X-OTA-SHA256
+    };
+
+    /** @brief Short name of a Result, e.g. "HashMismatch" */
+    static const char* resultToString(Result result);
 
     /**
      * @brief Constructor
@@ -85,6 +115,12 @@ public:
     /** @brief Returns the last version fetched from the server (after getServerVersion / check) */
     const char* getLastServerVersion() const;
 
+    /**
+     * @brief Size of the firmware offered by the server in the last version check
+     *        (X-OTA-Size, server >= 1.2.0). -1 = unknown.
+     */
+    int64_t getLastServerSize() const;
+
     // ── Auth & TLS ─────────────────────────────────────────────────────────────
 
     /**
@@ -109,6 +145,34 @@ public:
 
     /** @brief Network timeout in ms (default 15000) */
     void setTimeout(int ms);
+
+    /**
+     * @brief Require the X-OTA-SHA256 header (AP OTA Server >= 1.2.0).
+     *        false (default): without the header the hash check is skipped with a warning.
+     *        true:            without the header the update is refused (Result::HashMissing).
+     */
+    void requireHash(bool require = true);
+
+    // ── Unit (grouping chips of one device) ───────────────────────────────────
+
+    /**
+     * @brief Set the unit key — chips sending the same key are grouped into one
+     *        device on the server (sent as &unit= in step 1).
+     *        Typically the MAC of the main chip; secondary chips receive it over an
+     *        internal link (UART…) at startup. Kept in RAM only — no NVS.
+     *        Normalized like on the server: lowercase, ':' removed.
+     *        Valid key = [a-z0-9_-], 4–32 characters.
+     * @param key  Unit key; nullptr or "" clears it (parameter not sent)
+     * @return true if set (or cleared); false if invalid — the key is then
+     *         cleared and not sent
+     */
+    bool setUnit(const char* key);
+
+    /** @brief setUnit() from a raw 6-byte MAC address (e.g. of the main chip) */
+    void setUnitFromMAC(const uint8_t mac[6]);
+
+    /** @brief Returns the current unit key ("" = not set) */
+    const char* getUnit() const;
 
     // ── Scheduler ──────────────────────────────────────────────────────────────
 
@@ -195,13 +259,22 @@ public:
     bool isUpdateAvailable();
 
     /**
-     * @brief Download the firmware and write it to the OTA partition.
-     *        Internally calls isUpdateAvailable(); if versions differ, downloads and installs.
-     * @return true if the firmware was installed successfully
-     *         — caller must call esp_restart() to apply it
+     * @brief Check the server and, if the version differs, download, verify and
+     *        install the firmware.
+     *        Before download: the image must fit the OTA partition (size from step 1).
+     *        Before switching the boot partition: size and SHA-256 (when the server
+     *        sends them) and complete data received.
+     * @return Result::Updated if installed — caller must call esp_restart();
+     *         otherwise the reason (also available via getLastResult())
      *
      * Requires a partition table with ota_0 + ota_1.
      * Recommended caller task stack size: >= 8 KB
+     */
+    Result update();
+
+    /**
+     * @brief update() as bool (kept for compatibility).
+     * @return true if the firmware was installed — caller must call esp_restart()
      */
     bool performUpdate();
 
@@ -209,20 +282,60 @@ public:
      * @brief Check for and optionally download an update; marks the last check time.
      *        Combines performUpdate() and markChecked() — main entry point for a periodic task.
      * @return true if the firmware was installed — caller must call esp_restart()
+     *         (reason otherwise: getLastResult())
      *
      * Example:
      *   if (ota.isDue() && ota.check()) esp_restart();
      */
     bool check();
 
-    // ── Callback ───────────────────────────────────────────────────────────────
+    /** @brief Result of the last update() / performUpdate() / check() */
+    Result getLastResult() const;
 
-    /** @brief Callback with firmware download progress (0–100) */
+    // ── Callbacks ──────────────────────────────────────────────────────────────
+
+    /**
+     * @brief Callback with firmware download progress in percent (0–100).
+     *        Called only when the firmware size is known (X-OTA-Size or Content-Length).
+     */
     void setProgressCallback(void (*callback)(int progress));
+
+    /// Download progress in bytes; total = -1 when the size is unknown
+    using ProgressCallback = void (*)(int64_t written, int64_t total, void* userData);
+    /// Update started (server offers a different version); size = -1 when unknown
+    using StartCallback    = void (*)(const char* version, int64_t size, void* userData);
+    /// Final result of a started update (Updated, or the reason it failed)
+    using ResultCallback   = void (*)(Result result, void* userData);
+
+    /**
+     * @brief Callback with download progress in bytes.
+     * @param userData passed unchanged to every call (e.g. a context object)
+     */
+    void setProgressBytesCallback(ProgressCallback callback, void* userData = nullptr);
+
+    /**
+     * @brief Callback when an update starts. Always followed by the result callback.
+     * @param userData passed unchanged to every call
+     */
+    void setStartCallback(StartCallback callback, void* userData = nullptr);
+
+    /**
+     * @brief Callback with the final result of a started update.
+     *        Runs before update() returns — with Updated, before the caller restarts.
+     * @param userData passed unchanged to every call
+     */
+    void setResultCallback(ResultCallback callback, void* userData = nullptr);
 
 private:
     static const char* TAG;
     static const int   CHUNK_SIZE = 4096;
+    static const int   URL_MAX    = 1280;  // fits all fields fully percent-encoded
+
+    // Firmware info from the X-OTA-* response headers
+    struct FwInfo {
+        int64_t size;        // X-OTA-Size, -1 = not sent
+        char    sha256[65];  // X-OTA-SHA256 lowercase hex, "" = not sent / invalid
+    };
 
     char        _serverURL[256];
     char        _group[64];
@@ -230,12 +343,16 @@ private:
     char        _component[64];
     char        _hwVersion[32];
     char        _deviceKey[18];
+    char        _unitKey[33];
     char        _currentVersion[32];
     char        _lastServerVersion[32];
     char        _otaKey[128];
     const char* _rootCA;
     bool        _insecure;
     int         _timeoutMs;
+    bool        _requireHash;
+    Result      _lastResult;
+    FwInfo      _offered;             // headers from step 1 (version check)
 
     Schedule _schedule;
     uint32_t _intervalSeconds;
@@ -246,13 +363,25 @@ private:
     int64_t  _lastCheckUptimeUs;  // monotonic esp_timer value used for INTERVAL scheduling; -1 = never checked
 
     void (*_progressCallback)(int progress);
+    ProgressCallback _progressBytesCallback;
+    StartCallback    _startCallback;
+    ResultCallback   _resultCallback;
+    void*            _progressBytesUserData;
+    void*            _startUserData;
+    void*            _resultUserData;
 
     void     normalizeMAC(const char* mac, char* out, size_t len);
-    void     buildURL(char* buf, size_t len, bool download);
+    bool     buildURL(char* buf, size_t len, bool download);
     void     setupClientConfig(esp_http_client_config_t& config, const char* url);
-    esp_http_client_handle_t _openClient(const char* url, bool& wdtWasOn, int64_t* contentLength);
-    bool     downloadString(const char* url, char* buf, size_t len);
-    bool     downloadFirmware(const char* url);
+    static esp_err_t _httpEventHandler(esp_http_client_event_t* evt);
+    static bool      _fitsPartition(int64_t size, const esp_partition_t* partition);
+    esp_http_client_handle_t _openClient(const char* url, bool& wdtWasOn, FwInfo* info,
+                                         int64_t* contentLength, int* status);
+    bool     _fetchVersion(char* buf, size_t len, Result& error);
+    bool     _checkVersion(Result& result);
+    Result   _finish(Result result, bool started);
+    bool     downloadString(const char* url, char* buf, size_t len, FwInfo* info, Result& error);
+    Result   downloadFirmware(const char* url, const esp_partition_t* partition);
     void     markChecked();
     int64_t  getUptimeSeconds() const;
     uint32_t getServerInterval() const;

@@ -15,3 +15,6 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+# Pracovní poznámky
+TODO_next_version.md
