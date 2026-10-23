@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.4.0] - 2026-10-23
+
+Odložená aktualizace — zařízení se dál hlásí podle plánu, ale stahování může aplikace dočasně zakázat (nízká baterie, probíhající proces…) a server vidí proč. Vydáno spolu s AP_OTAServer 1.3.0 (stav `deferred`, pilotní vydání) a taskOTA 2.3.0.
+
+### Added
+- `check(const char* deferReason = nullptr)` — s důvodem jen ohlášení (krok 1 s `&deferred=<důvod>`), nic se nestahuje, plánovač se posune. Bez důvodu beze změny proti 1.3.0.
+- `Result::Deferred` — server nabízí jinou verzi, stažení odloženo; shodná verze dál `UpToDate`. Result callback se volá i s `Deferred` (start callback ne, nic se nestahuje).
+- `isUpdatePending()` — poslední kontrola skončila `Deferred` → po povolení zavolat `update()` hned, bez čekání na další termín.
+- Důvod je slug `[a-z0-9_-]{1,32}` se stejnou normalizací jako `unit`, posílá se jen v kroku 1.
+
+### Changed
+- Normalizace slugu sdílená pro `setUnit()` a důvod odložení (beze změny chování `setUnit()`).
+
+**Otestováno na HW** 2026-10-23 — měření teploty serverovny (ESP32 / LaskaKit ESPlan, LAN8720A, ESP-IDF 6.1, taskOTA 2.3.0) proti AP_OTAServer 1.3.0: pilotní verze 26.10.2 nabídnuta jen testovacímu zařízení; `check("battery")` → `Deferred`, nic nestaženo, server „Odloženo: battery“; po povolení `isUpdatePending()` → instalace do minuty (taskOTA), 758 832 B, SHA-256 OK, `Updated`, nová verze naběhla; ohlášení s důvodem při shodné verzi → `UpToDate`, server odložení zrušil. Regrese: `check()` bez důvodu ve finálním FW 26.10.3 → běžná kontrola, `UpToDate`.
+
 ## [1.3.0] - 2026-10-21
 
 Podpora AP_OTAServer 1.2.0 (hlavičky `X-OTA-Size` / `X-OTA-SHA256`, parametr `unit`) + ESP-IDF 6. Se starším serverem funguje dál, jen bez kontrol velikosti a hashe.

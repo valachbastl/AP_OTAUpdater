@@ -9,7 +9,7 @@ Detects any version difference (not just newer), so both upgrades and downgrades
 ## Requirements
 
 - ESP-IDF 5.x or 6.x (SHA-256 via mbedTLS on 5.x, PSA Crypto on 6.x — selected automatically)
-- AP OTA Server; size and SHA-256 checks need server **1.2.0+** (older servers work without them)
+- AP OTA Server; size and SHA-256 checks need server **1.2.0+**, the *Deferred* state on the server **1.3.0+** (older servers work without them)
 - OTA partition table (`ota_0` + `ota_1`), caller task stack ≥ 8 KB
 
 ## Installation
@@ -25,7 +25,7 @@ Or with specific version:
 
 ```ini
 lib_deps =
-    https://github.com/valachbastl/AP_OTAUpdater.git#v1.3.0
+    https://github.com/valachbastl/AP_OTAUpdater.git#v1.4.0
 ```
 
 ## Partition table
@@ -125,6 +125,24 @@ ota.setUnitFromMAC(mainChipMac);   // or ota.setUnit("aa:bb:cc:dd:ee:ff")
 
 Key = `[a-z0-9_-]`, 4–32 characters, lowercase, `:` dropped (same normalization as the server). Until the key is known, don't set it — the parameter is then not sent.
 
+## Deferred update (AP OTA Server ≥ 1.3.0)
+
+The application can temporarily forbid downloading (low battery, a running process…) while the device keeps reporting to the server on schedule — otherwise it would look offline. Pass a reason to `check()`:
+
+```cpp
+const char* reason = batteryLow() ? "battery" : nullptr;   // nullptr = download allowed
+
+if (ota.isDue() && ota.check(reason)) esp_restart();
+
+// Allowed again and an update is waiting → install now, don't wait for the next isDue()
+if (!reason && ota.isUpdatePending() &&
+    ota.update() == AP_OTAUpdater::Result::Updated) esp_restart();
+```
+
+With a reason, only the version check runs (`&deferred=<reason>` in step 1), nothing is downloaded and the schedule moves on. A different offered version ends as `Result::Deferred` (`isUpdatePending()` is then true, the version is in `getLastServerVersion()`); the same version ends as `UpToDate`. The result callback is called with `Deferred` too, the start callback is not.
+
+Reason = `[a-z0-9_-]`, 1–32 characters, normalized like the unit key. An invalid reason is sent as `unknown` — the download stays deferred. Every request without a reason (`update()`, `check()`, `getServerVersion()`) tells the server the device no longer defers. Servers without this feature ignore the parameter.
+
 ## Result and callbacks
 
 ```cpp
@@ -141,7 +159,7 @@ ota.setProgressCallback([](int progress) {
     ESP_LOGI("OTA", "Download: %d%%", progress);   // only when size is known
 });
 ota.setProgressBytesCallback([](int64_t written, int64_t total, void* ctx) { /* total -1 = unknown */ });
-ota.setResultCallback([](AP_OTAUpdater::Result r, void* ctx) { /* after every started update */ });
+ota.setResultCallback([](AP_OTAUpdater::Result r, void* ctx) { /* after every started update + Deferred */ });
 ```
 
 The optional last argument of the setters (`userData`) is passed unchanged to the callback as `ctx` — e.g. a pointer to your own object:
@@ -156,6 +174,7 @@ ota.setResultCallback([](AP_OTAUpdater::Result r, void* ctx) {
 |--------|---------|
 | `UpToDate` | Server offers the running version (also when the server blocks the update) |
 | `Updated` | Installed — call `esp_restart()` |
+| `Deferred` | Server offers a different version, download deferred by `check(reason)` |
 | `NoFirmware` | No firmware on the server for this group/type/component/hw (404) |
 | `ServerError` / `NetworkError` | HTTP status / connection problem |
 | `NoPartition` / `TooLarge` | No OTA partition / firmware does not fit |
@@ -231,6 +250,8 @@ All slug parameters must match the values registered on the server.
 | `update()` | Check + download + verify + install; returns `Result` |
 | `performUpdate()` | `update()` as bool; true on success |
 | `check()` | `performUpdate()` + marks last check time; use with `isDue()` |
+| `check(reason)` | Report in without downloading (`&deferred=`); marks last check time |
+| `isUpdatePending()` | Last check ended `Deferred` — call `update()` once allowed |
 | `getLastResult()` / `resultToString(r)` | Result of the last update attempt / its name |
 
 ### Schedule modes

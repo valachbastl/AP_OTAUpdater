@@ -33,6 +33,23 @@ void copyStr(char* dst, size_t size, const char* src)
     dst[size - 1] = '\0';
 }
 
+// Slug normalization shared with the server: lowercase, ':' dropped,
+// [a-z0-9_-], minLen..size-1 chars. On failure out = "" and false.
+bool normalizeSlug(const char* in, char* out, size_t size, size_t minLen)
+{
+    size_t j = 0;
+    for (size_t i = 0; in && in[i]; i++) {
+        char c = (char)tolower((unsigned char)in[i]);
+        if (c == ':') continue;
+        bool valid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
+        if (!valid || j >= size - 1) { out[0] = '\0'; return false; }
+        out[j++] = c;
+    }
+    out[j] = '\0';
+    if (j < minLen) { out[0] = '\0'; return false; }
+    return true;
+}
+
 // Appends to a fixed buffer; remembers truncation instead of cutting silently
 class UrlBuilder
 {
@@ -269,6 +286,7 @@ time_t      AP_OTAUpdater::getLastCheckTime()      const { return _lastCheckTime
 const char* AP_OTAUpdater::getUnit()              const { return _unitKey; }
 
 AP_OTAUpdater::Result AP_OTAUpdater::getLastResult() const { return _lastResult; }
+bool AP_OTAUpdater::isUpdatePending() const { return _lastResult == Result::Deferred; }
 
 void AP_OTAUpdater::setOTAKey(const char* key)
 {
@@ -293,29 +311,16 @@ void AP_OTAUpdater::requireHash(bool require) { _requireHash = require; }
 
 bool AP_OTAUpdater::setUnit(const char* key)
 {
-    _unitKey[0] = '\0';
-    if (!key || !key[0]) return true;
+    if (!key || !key[0]) {
+        _unitKey[0] = '\0';
+        return true;
+    }
 
     // Same normalization as the server: lowercase, ':' dropped, [a-z0-9_-]{4,32}
-    char   tmp[sizeof(_unitKey)];
-    size_t j  = 0;
-    bool   ok = true;
-    for (size_t i = 0; key[i]; i++) {
-        char c = (char)tolower((unsigned char)key[i]);
-        if (c == ':') continue;
-        bool valid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-';
-        if (!valid || j >= sizeof(tmp) - 1) { ok = false; break; }
-        tmp[j++] = c;
-    }
-    if (j < 4) ok = false;
-
-    if (!ok) {
+    if (!normalizeSlug(key, _unitKey, sizeof(_unitKey), 4)) {
         ESP_LOGW(TAG, "Invalid unit key '%s' — must be [a-z0-9_-], 4-32 chars; not sent", key);
         return false;
     }
-
-    tmp[j] = '\0';
-    memcpy(_unitKey, tmp, j + 1);
     return true;
 }
 
@@ -367,6 +372,7 @@ const char* AP_OTAUpdater::resultToString(Result result)
         case Result::SizeMismatch: return "SizeMismatch";
         case Result::HashMissing:  return "HashMissing";
         case Result::HashMismatch: return "HashMismatch";
+        case Result::Deferred:     return "Deferred";
     }
     return "Unknown";
 }
@@ -486,7 +492,7 @@ uint32_t AP_OTAUpdater::getServerInterval() const
     }
 }
 
-bool AP_OTAUpdater::buildURL(char* buf, size_t len, bool download)
+bool AP_OTAUpdater::buildURL(char* buf, size_t len, bool download, const char* deferReason)
 {
     UrlBuilder url(buf, len);
     url.append(_serverURL);
@@ -499,8 +505,9 @@ bool AP_OTAUpdater::buildURL(char* buf, size_t len, bool download)
     url.appendParam("fw",        _currentVersion);
     url.appendParam("uptime",    (long long)getUptimeSeconds());
     url.appendParam("interval",  (long long)getServerInterval());
-    // &unit= only in step 1 — the server evaluates it there only
+    // &unit= and &deferred= only in step 1 — the server evaluates them there only
     if (!download && _unitKey[0]) url.appendParam("unit", _unitKey);
+    if (!download && deferReason) url.appendParam("deferred", deferReason);
     if (download) url.appendParam("download", "1");
 
     if (!url.ok()) {
@@ -885,10 +892,10 @@ AP_OTAUpdater::Result AP_OTAUpdater::downloadFirmware(const char* url, const esp
 // Public OTA operations
 // =============================================================================
 
-bool AP_OTAUpdater::_fetchVersion(char* buf, size_t len, Result& error)
+bool AP_OTAUpdater::_fetchVersion(char* buf, size_t len, Result& error, const char* deferReason)
 {
     char url[URL_MAX];
-    if (!buildURL(url, sizeof(url), false)) {
+    if (!buildURL(url, sizeof(url), false, deferReason)) {
         error = Result::ServerError;
         return false;
     }
@@ -906,10 +913,10 @@ bool AP_OTAUpdater::_fetchVersion(char* buf, size_t len, Result& error)
 }
 
 // true = server offers a different version; false → result = UpToDate or the error
-bool AP_OTAUpdater::_checkVersion(Result& result)
+bool AP_OTAUpdater::_checkVersion(Result& result, const char* deferReason)
 {
     char serverVer[32];
-    if (!_fetchVersion(serverVer, sizeof(serverVer), result)) return false;
+    if (!_fetchVersion(serverVer, sizeof(serverVer), result, deferReason)) return false;
 
     // Any difference counts — the server decides what to offer (a blocked
     // update makes it return the device's own version)
@@ -920,6 +927,7 @@ bool AP_OTAUpdater::_checkVersion(Result& result)
     return differs;
 }
 
+// Stores the result; the result callback gets every started update and Deferred
 AP_OTAUpdater::Result AP_OTAUpdater::_finish(Result result, bool started)
 {
     _lastResult = result;
@@ -929,7 +937,9 @@ AP_OTAUpdater::Result AP_OTAUpdater::_finish(Result result, bool started)
         } else {
             ESP_LOGE(TAG, "Update result: %s", resultToString(result));
         }
-        if (_resultCallback) _resultCallback(result, _resultUserData);
+    }
+    if ((started || result == Result::Deferred) && _resultCallback) {
+        _resultCallback(result, _resultUserData);
     }
     return result;
 }
@@ -949,10 +959,29 @@ bool AP_OTAUpdater::isUpdateAvailable()
 
 AP_OTAUpdater::Result AP_OTAUpdater::update()
 {
+    return _run(nullptr);
+}
+
+// deferReason == nullptr → normal update; otherwise report in only (step 1 + &deferred=)
+AP_OTAUpdater::Result AP_OTAUpdater::_run(const char* deferReason)
+{
+    // Any non-null reason defers — an invalid one must not turn into a download
+    char reason[SLUG_SIZE];
+    if (deferReason && !normalizeSlug(deferReason, reason, sizeof(reason), 1)) {
+        ESP_LOGW(TAG, "Invalid defer reason '%s' — must be [a-z0-9_-], 1-32 chars; sent as 'unknown'",
+                 deferReason);
+        copyStr(reason, sizeof(reason), "unknown");
+    }
+
     Result result;
-    if (!_checkVersion(result)) {
+    if (!_checkVersion(result, deferReason ? reason : nullptr)) {
         if (result == Result::UpToDate) ESP_LOGI(TAG, "No update available");
         return _finish(result, false);
+    }
+
+    if (deferReason) {
+        ESP_LOGI(TAG, "Update to %s deferred (%s)", _lastServerVersion, reason);
+        return _finish(Result::Deferred, false);
     }
 
     if (_startCallback) _startCallback(_lastServerVersion, _offered.size, _startUserData);
@@ -982,8 +1011,8 @@ bool AP_OTAUpdater::performUpdate()
     return update() == Result::Updated;
 }
 
-bool AP_OTAUpdater::check()
+bool AP_OTAUpdater::check(const char* deferReason)
 {
     markChecked();
-    return performUpdate();
+    return _run(deferReason) == Result::Updated;
 }

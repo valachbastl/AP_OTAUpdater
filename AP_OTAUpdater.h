@@ -14,8 +14,10 @@
  * AP_OTAUpdater — OTA client for AP OTA Server
  *
  * Protocol (AP OTA Server ota.php):
- *   Step 1 – GET /ota.php?group=&type=&component=&hw=&device=&fw=&uptime=&interval=[&unit=]
+ *   Step 1 – GET /ota.php?group=&type=&component=&hw=&device=&fw=&uptime=&interval=[&unit=][&deferred=]
  *             → 200 plain text "26.5.1"   |  404 no firmware
+ *             &deferred=<reason> — the device reports in but may not download now
+ *             (check(reason)); older servers ignore it
  *   Step 2 – GET /ota.php?...&download=1
  *             → 200 binary firmware data
  *   Both steps (server >= 1.2.0) also send X-OTA-Size (bytes) and X-OTA-SHA256
@@ -53,6 +55,14 @@
  *           task.wait();
  *       }
  *   }
+ *
+ * Deferred update — the application temporarily forbids downloading (low battery,
+ * running process…) but keeps reporting to the server on schedule:
+ *
+ *       const char* reason = batteryLow() ? "battery" : nullptr;   // nullptr = allowed
+ *       if (ota.isDue() && ota.check(reason)) esp_restart();
+ *       if (!reason && ota.isUpdatePending() &&
+ *           ota.update() == AP_OTAUpdater::Result::Updated) esp_restart();
  */
 class AP_OTAUpdater
 {
@@ -78,7 +88,8 @@ public:
         WriteError,    ///< esp_ota_begin / write / end / set_boot_partition failed
         SizeMismatch,  ///< downloaded size differs from X-OTA-Size / Content-Length, or stream incomplete
         HashMissing,   ///< requireHash(true) and the server sent no X-OTA-SHA256
-        HashMismatch   ///< SHA-256 of the downloaded image differs from X-OTA-SHA256
+        HashMismatch,  ///< SHA-256 of the downloaded image differs from X-OTA-SHA256
+        Deferred       ///< server offers a different version, download deferred by check(reason)
     };
 
     /** @brief Short name of a Result, e.g. "HashMismatch" */
@@ -281,13 +292,31 @@ public:
     /**
      * @brief Check for and optionally download an update; marks the last check time.
      *        Combines performUpdate() and markChecked() — main entry point for a periodic task.
+     *
+     * @param deferReason  nullptr (default) = download allowed, same as before.
+     *        Otherwise the device only reports in (step 1 with &deferred=<reason>) and
+     *        nothing is downloaded: a different offered version ends as Result::Deferred
+     *        (isUpdatePending() then true), the same version as UpToDate. The schedule
+     *        moves on either way, so the device does not look offline on the server.
+     *        Reason = slug [a-z0-9_-], 1–32 chars (e.g. "battery", "busy"), normalized
+     *        like setUnit(); an invalid one is sent as "unknown" — still deferred.
+     *        Any request without a reason (update(), getServerVersion(), …) tells the
+     *        server the device no longer defers.
      * @return true if the firmware was installed — caller must call esp_restart()
      *         (reason otherwise: getLastResult())
      *
      * Example:
      *   if (ota.isDue() && ota.check()) esp_restart();
      */
-    bool check();
+    bool check(const char* deferReason = nullptr);
+
+    /**
+     * @brief true if the last update() / check() ended with Result::Deferred — the
+     *        server offers getLastServerVersion() and the application has not allowed
+     *        the download yet. Once allowed again, call update() right away instead of
+     *        waiting for the next isDue(). Cleared by the next update() / check().
+     */
+    bool isUpdatePending() const;
 
     /** @brief Result of the last update() / performUpdate() / check() */
     Result getLastResult() const;
@@ -304,7 +333,7 @@ public:
     using ProgressCallback = void (*)(int64_t written, int64_t total, void* userData);
     /// Update started (server offers a different version); size = -1 when unknown
     using StartCallback    = void (*)(const char* version, int64_t size, void* userData);
-    /// Final result of a started update (Updated, or the reason it failed)
+    /// Final result of a started update (Updated, or the reason it failed), or Deferred
     using ResultCallback   = void (*)(Result result, void* userData);
 
     /**
@@ -320,7 +349,8 @@ public:
     void setStartCallback(StartCallback callback, void* userData = nullptr);
 
     /**
-     * @brief Callback with the final result of a started update.
+     * @brief Callback with the final result of a started update, and with
+     *        Result::Deferred (no start callback then — nothing is downloaded).
      *        Runs before update() returns — with Updated, before the caller restarts.
      * @param userData passed unchanged to every call
      */
@@ -330,6 +360,7 @@ private:
     static const char* TAG;
     static const int   CHUNK_SIZE = 4096;
     static const int   URL_MAX    = 1280;  // fits all fields fully percent-encoded
+    static const int   SLUG_SIZE  = 33;    // unit key / defer reason: 32 chars + '\0'
 
     // Firmware info from the X-OTA-* response headers
     struct FwInfo {
@@ -343,7 +374,7 @@ private:
     char        _component[64];
     char        _hwVersion[32];
     char        _deviceKey[18];
-    char        _unitKey[33];
+    char        _unitKey[SLUG_SIZE];
     char        _currentVersion[32];
     char        _lastServerVersion[32];
     char        _otaKey[128];
@@ -371,14 +402,15 @@ private:
     void*            _resultUserData;
 
     void     normalizeMAC(const char* mac, char* out, size_t len);
-    bool     buildURL(char* buf, size_t len, bool download);
+    bool     buildURL(char* buf, size_t len, bool download, const char* deferReason = nullptr);
     void     setupClientConfig(esp_http_client_config_t& config, const char* url);
     static esp_err_t _httpEventHandler(esp_http_client_event_t* evt);
     static bool      _fitsPartition(int64_t size, const esp_partition_t* partition);
     esp_http_client_handle_t _openClient(const char* url, bool& wdtWasOn, FwInfo* info,
                                          int64_t* contentLength, int* status);
-    bool     _fetchVersion(char* buf, size_t len, Result& error);
-    bool     _checkVersion(Result& result);
+    bool     _fetchVersion(char* buf, size_t len, Result& error, const char* deferReason = nullptr);
+    bool     _checkVersion(Result& result, const char* deferReason = nullptr);
+    Result   _run(const char* deferReason);
     Result   _finish(Result result, bool started);
     bool     downloadString(const char* url, char* buf, size_t len, FwInfo* info, Result& error);
     Result   downloadFirmware(const char* url, const esp_partition_t* partition);
