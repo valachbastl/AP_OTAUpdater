@@ -29,7 +29,10 @@
  *              still work, just without the checks (see requireHash()).
  * Auth:        setOTAKey() — X-OTA-Key header (APP_SECRET on server, OTA_AUTH=true)
  * TLS:         embedded certificate bundle (default), custom CA, or no verification
- * WDT:         automatic handling, compatible with AP_TaskUtils tasks
+ * WDT:         automatic handling, compatible with AP_TaskUtils tasks — the task is
+ *              unregistered from the task WDT while it waits on the network (connect
+ *              + download); a stalled connection ends with the network timeout
+ *              (setTimeout(), default 15 s), not a WDT panic
  * Versioning:  compares any version difference → both upgrade and downgrade work
  *              (the server decides what to offer, incl. frozen devices / no-downgrade)
  * Threading:   instance is not thread-safe — call only from a single task
@@ -154,7 +157,7 @@ public:
      */
     void setInsecure(bool insecure = true);
 
-    /** @brief Network timeout in ms (default 15000) */
+    /** @brief Network timeout in ms (default 15000, min. 1000 — lower values are raised) */
     void setTimeout(int ms);
 
     /**
@@ -358,9 +361,10 @@ public:
 
 private:
     static const char* TAG;
-    static const int   CHUNK_SIZE = 4096;
-    static const int   URL_MAX    = 1280;  // fits all fields fully percent-encoded
-    static const int   SLUG_SIZE  = 33;    // unit key / defer reason: 32 chars + '\0'
+    static const int   CHUNK_SIZE     = 4096;
+    static const int   TIMEOUT_MIN_MS = 1000;
+    static const int   URL_MAX        = 1280;  // fits all fields fully percent-encoded
+    static const int   SLUG_SIZE      = 33;    // unit key / defer reason: 32 chars + '\0'
 
     // Firmware info from the X-OTA-* response headers
     struct FwInfo {

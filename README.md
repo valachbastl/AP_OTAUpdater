@@ -2,7 +2,7 @@
 
 OTA firmware updater for [AP OTA Server](https://github.com/valachbastl/AP_OTAServer). Supports HTTP and HTTPS, works with any network interface — WiFi, W5500, LAN8720A, or ESP32-P4 built-in EMAC.
 
-Compatible with AP_TaskUtils tasks — watchdog is managed transparently during update.
+Compatible with AP_TaskUtils tasks — watchdog is managed transparently during update: the task leaves the task WDT while it waits on the network (connect + download), and a stalled connection ends with the network timeout (`setTimeout()`, default 15 s) instead of a WDT panic.
 
 Detects any version difference (not just newer), so both upgrades and downgrades work.
 
@@ -25,7 +25,7 @@ Or with specific version:
 
 ```ini
 lib_deps =
-    https://github.com/valachbastl/AP_OTAUpdater.git#v1.4.0
+    https://github.com/valachbastl/AP_OTAUpdater.git#v1.4.1
 ```
 
 ## Partition table
@@ -232,7 +232,7 @@ All slug parameters must match the values registered on the server.
 | `setOTAKey(key)` | Set auth key (X-OTA-Key header, OTA_AUTH on server) |
 | `setCACert(pem)` | HTTPS with custom CA certificate |
 | `setInsecure()` | HTTPS without certificate verification |
-| `setTimeout(ms)` | Network timeout in ms (default 15000) |
+| `setTimeout(ms)` | Network timeout in ms (default 15000, min. 1000 — lower values are raised) |
 | `requireHash(bool)` | Refuse updates without `X-OTA-SHA256` |
 | `setUnit(key)` / `setUnitFromMAC(mac)` | Unit key for grouping chips (`&unit=`) |
 | `getUnit()` | Current unit key (`""` = not set) |

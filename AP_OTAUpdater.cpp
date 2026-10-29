@@ -305,7 +305,15 @@ void AP_OTAUpdater::setInsecure(bool insecure)
     if (insecure) _rootCA = nullptr;
 }
 
-void AP_OTAUpdater::setTimeout(int ms) { _timeoutMs = ms; }
+void AP_OTAUpdater::setTimeout(int ms)
+{
+    // <= 0 would mean "default" or block forever in esp_http_client / esp_transport
+    if (ms < TIMEOUT_MIN_MS) {
+        ESP_LOGW(TAG, "setTimeout(%d) below minimum — using %d ms", ms, TIMEOUT_MIN_MS);
+        ms = TIMEOUT_MIN_MS;
+    }
+    _timeoutMs = ms;
+}
 
 void AP_OTAUpdater::requireHash(bool require) { _requireHash = require; }
 
@@ -415,12 +423,15 @@ bool AP_OTAUpdater::isDue() const
             if (_lastCheckUptimeUs < 0) return true;
             return (esp_timer_get_time() - _lastCheckUptimeUs) >= (int64_t)_intervalSeconds * 1000000LL;
 
-        case DAILY: {
+        case DAILY:
+        case WEEKLY: {
             time_t now = time(nullptr);
             if (now < 1000000000L) return false; // time not synchronized
 
             struct tm tmNow;
             localtime_r(&now, &tmNow);
+
+            if (_schedule == WEEKLY && tmNow.tm_wday != _scheduledDay) return false;
 
             struct tm tmSched   = tmNow;
             tmSched.tm_hour     = _scheduledHour;
@@ -429,24 +440,6 @@ bool AP_OTAUpdater::isDue() const
             time_t scheduledNow = mktime(&tmSched);
 
             // true if current time is past the scheduled time and no check has happened since
-            return (now >= scheduledNow) && (_lastCheckTime < scheduledNow);
-        }
-
-        case WEEKLY: {
-            time_t now = time(nullptr);
-            if (now < 1000000000L) return false; // time not synchronized
-
-            struct tm tmNow;
-            localtime_r(&now, &tmNow);
-
-            if (tmNow.tm_wday != _scheduledDay) return false;
-
-            struct tm tmSched   = tmNow;
-            tmSched.tm_hour     = _scheduledHour;
-            tmSched.tm_min      = _scheduledMinute;
-            tmSched.tm_sec      = 0;
-            time_t scheduledNow = mktime(&tmSched);
-
             return (now >= scheduledNow) && (_lastCheckTime < scheduledNow);
         }
     }
@@ -719,9 +712,11 @@ AP_OTAUpdater::Result AP_OTAUpdater::downloadFirmware(const char* url, const esp
         return Result::ServerError;
     }
 
+    // Close the connection and return to the task WDT (every exit after _openClient)
     auto closeClient = [&]() {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
+        if (wdtWasOn) esp_task_wdt_add(NULL);
     };
 
     // Size: X-OTA-Size → Content-Length → unknown. Content-Length is often missing
@@ -746,7 +741,6 @@ AP_OTAUpdater::Result AP_OTAUpdater::downloadFirmware(const char* url, const esp
     } else if (_requireHash) {
         ESP_LOGE(TAG, "Server sent no X-OTA-SHA256 and requireHash() is set — update refused");
         closeClient();
-        if (wdtWasOn) esp_task_wdt_add(NULL);
         return Result::HashMissing;
     } else {
         ESP_LOGW(TAG, "Server sent no X-OTA-SHA256 (server < 1.2.0?) — hash check skipped");
@@ -754,7 +748,6 @@ AP_OTAUpdater::Result AP_OTAUpdater::downloadFirmware(const char* url, const esp
 
     if (!_fitsPartition(expectedSize, partition)) {
         closeClient();
-        if (wdtWasOn) esp_task_wdt_add(NULL);
         return Result::TooLarge;
     }
 
@@ -767,13 +760,13 @@ AP_OTAUpdater::Result AP_OTAUpdater::downloadFirmware(const char* url, const esp
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "OTA begin failed: %s", esp_err_to_name(err));
         closeClient();
-        if (wdtWasOn) esp_task_wdt_add(NULL);
         return Result::WriteError;
     }
 
-    // Re-register with WDT before the write loop — reset every chunk
-    if (wdtWasOn) esp_task_wdt_add(NULL);
-
+    // The task stays unregistered from WDT for the whole transfer — a single
+    // esp_http_client_read() may block up to the network timeout (default 15 s),
+    // longer than a typical task WDT (AP_TaskUtils 5 s). A stalled connection is
+    // ended by that timeout (NetworkError / SizeMismatch), not by a WDT panic.
     uint8_t* chunk = (uint8_t*)malloc(CHUNK_SIZE);
     if (!chunk) {
         ESP_LOGE(TAG, "No memory for chunk buffer");
@@ -826,8 +819,6 @@ AP_OTAUpdater::Result AP_OTAUpdater::downloadFirmware(const char* url, const esp
                 _progressCallback(percent);
             }
         }
-
-        if (wdtWasOn) esp_task_wdt_reset();
     }
 
     free(chunk);

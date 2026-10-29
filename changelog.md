@@ -1,8 +1,16 @@
 # Changelog
 
+## [1.4.1] - 2026-10-29
+
+### Fixed
+- Zásek sítě během stahování firmwaru končil pádem na task watchdog místo chyby. Před stahovací smyčkou se task znovu přihlásil k WDT, ale jedno `esp_http_client_read()` smí blokovat až síťový timeout (`setTimeout()`, výchozí 15 s) — déle než WDT tasku (AP_TaskUtils 5 s). Task teď zůstává mimo WDT po celý přenos (jako už při navazování spojení), k WDT se vrací po uzavření spojení; zaseknuté spojení ukončí síťový timeout (`NetworkError` / `SizeMismatch`).
+- `setTimeout()` s hodnotou ≤ 0 se předala HTTP klientovi beze změny (0 = jeho výchozí hodnota, záporná mohla blokovat bez omezení). Hodnoty pod 1000 ms se teď zvednou na 1000 ms s varováním.
+
+**Otestováno na HW** 2026-10-29 — ESP32-P4 (WiFi přes ESP32-C6 / SDIO, ESP-IDF 6.1), firmware 3,3 MB: pád na task WDT během stahování z 1.4.0 se už neopakuje, opakované aktualizace ze serveru OK (SHA-256 OK, nová verze naběhla). PM zámek z 1.3.0 ověřen i na ESP32-P4 + SDIO.
+
 ## [1.4.0] - 2026-10-23
 
-Odložená aktualizace — zařízení se dál hlásí podle plánu, ale stahování může aplikace dočasně zakázat (nízká baterie, probíhající proces…) a server vidí proč. Vydáno spolu s AP_OTAServer 1.3.0 (stav `deferred`, pilotní vydání) a taskOTA 2.3.0.
+Odložená aktualizace — zařízení se dál hlásí podle plánu, ale stahování může aplikace dočasně zakázat (nízká baterie, probíhající proces…) a server vidí proč. Vydáno spolu s AP_OTAServer 1.3.0 (stav `deferred`, pilotní vydání).
 
 ### Added
 - `check(const char* deferReason = nullptr)` — s důvodem jen ohlášení (krok 1 s `&deferred=<důvod>`), nic se nestahuje, plánovač se posune. Bez důvodu beze změny proti 1.3.0.
@@ -13,7 +21,7 @@ Odložená aktualizace — zařízení se dál hlásí podle plánu, ale stahov�
 ### Changed
 - Normalizace slugu sdílená pro `setUnit()` a důvod odložení (beze změny chování `setUnit()`).
 
-**Otestováno na HW** 2026-10-23 — měření teploty serverovny (ESP32 / LaskaKit ESPlan, LAN8720A, ESP-IDF 6.1, taskOTA 2.3.0) proti AP_OTAServer 1.3.0: pilotní verze 26.10.2 nabídnuta jen testovacímu zařízení; `check("battery")` → `Deferred`, nic nestaženo, server „Odloženo: battery“; po povolení `isUpdatePending()` → instalace do minuty (taskOTA), 758 832 B, SHA-256 OK, `Updated`, nová verze naběhla; ohlášení s důvodem při shodné verzi → `UpToDate`, server odložení zrušil. Regrese: `check()` bez důvodu ve finálním FW 26.10.3 → běžná kontrola, `UpToDate`.
+**Otestováno na HW** 2026-10-23 — ESP32 (LaskaKit ESPlan, Ethernet LAN8720A, ESP-IDF 6.1) proti AP_OTAServer 1.3.0: pilotní verze nabídnuta jen testovacímu zařízení; `check("battery")` → `Deferred`, nic nestaženo, server „Odloženo: battery“; po povolení `isUpdatePending()` → instalace do minuty, 758 832 B, SHA-256 OK, `Updated`, nová verze naběhla; ohlášení s důvodem při shodné verzi → `UpToDate`, server odložení zrušil. Regrese: `check()` bez důvodu → běžná kontrola, `UpToDate`.
 
 ## [1.3.0] - 2026-10-21
 
@@ -22,7 +30,7 @@ Podpora AP_OTAServer 1.2.0 (hlavičky `X-OTA-Size` / `X-OTA-SHA256`, parametr `u
 ### Added
 - Kontrola **SHA-256** staženého obrazu proti `X-OTA-SHA256` — počítá se průběžně při zápisu, při neshodě `esp_ota_abort()` a boot oddíl se nepřepne. Bez hlavičky (server < 1.2.0) se kontrola přeskočí s varováním; `requireHash(true)` takový update odmítne.
 - Velikost firmwaru z `X-OTA-Size` (pořadí `X-OTA-Size` → `Content-Length` → neznámá), hlavičky odpovědi čtené přes `event_handler` HTTP klienta.
-- Kontrola, že se FW vejde do OTA oddílu — už po kroku 1 (vůbec se nestahuje) a znovu před `esp_ota_begin()`. Flash se dál maže po sektorech během zápisu (`OTA_WITH_SEQUENTIAL_WRITES`) i při známé velikosti — zkoušené jednorázové smazání celého obrazu předem (~2 s na 1 MB) se na HOME-Thermostat BOARD časově shodovalo s `STALE_PACKET_ERROR` na lince k displeji, mimo OTA se tahle chyba neobjevuje.
+- Kontrola, že se FW vejde do OTA oddílu — už po kroku 1 (vůbec se nestahuje) a znovu před `esp_ota_begin()`. Flash se dál maže po sektorech během zápisu (`OTA_WITH_SEQUENTIAL_WRITES`) i při známé velikosti — zkoušené jednorázové smazání celého obrazu předem (~2 s na 1 MB) blokovalo ostatní tasky aplikace (výpadky komunikace po UART během OTA, mimo OTA se neobjevují).
 - `setUnit()` / `setUnitFromMAC()` / `getUnit()` — seskupení čipů do přístroje (`&unit=` v kroku 1), normalizace a validace jako na serveru, jen v RAM.
 - `enum class Result` + `update()`, `getLastResult()`, `resultToString()` — důvod, proč update neproběhl (`NoFirmware`, `TooLarge`, `HashMismatch`, …). `bool` varianty (`performUpdate()`, `check()`) zachovány.
 - Callbacky `setStartCallback()` (verze + velikost), `setProgressBytesCallback()` (bajty, i při neznámé velikosti), `setResultCallback()` — s volitelným `userData` (kontext předaný do callbacku); `getLastServerSize()`.
@@ -40,7 +48,7 @@ Podpora AP_OTAServer 1.2.0 (hlavičky `X-OTA-Size` / `X-OTA-SHA256`, parametr `u
 - Hodnoty v URL se kódují (RFC 3986) — pro běžné slugy/verze/MAC se URL nemění; příliš dlouhá URL se odmítne s chybou místo tichého useknutí (dřív `snprintf` do 768 B).
 - Konstruktor a settery snesou `nullptr` (bere se jako prázdný řetězec / zrušení).
 
-**Otestováno na HW** — HOME-Thermostat BOARD (ESP32-P4, W5500, ESP-IDF 6.1) proti produkčnímu serveru přes Cloudflare: reálný update 26.10.3 → 26.10.4, velikost z `X-OTA-Size`, SHA-256 OK, naběhla nová verze, 404 bez FW i `UpToDate` správně. Dále HOME-Thermostat DISPLAY (ESP32-S3, WiFi): update 26.10.3 → 26.10.4 OK.
+**Otestováno na HW** — ESP32-P4 (Ethernet W5500, ESP-IDF 6.1) proti produkčnímu serveru přes Cloudflare: reálný update na novou verzi, velikost z `X-OTA-Size`, SHA-256 OK, naběhla nová verze, 404 bez FW i `UpToDate` správně. Dále ESP32-S3 (WiFi): update OK.
 
 ## [1.2.0] - 2026-07-27
 
